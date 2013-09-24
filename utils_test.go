@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -42,7 +43,7 @@ func newTestRuntime() (*Runtime, error) {
 		return nil, err
 	}
 
-	runtime, err := NewRuntimeFromDirectory(root, false)
+	runtime, err := NewRuntimeFromDirectory(root, NewDeviceSetWrapper(globalRuntime.deviceSet, filepath.Base(root)), false)
 	if err != nil {
 		return nil, err
 	}

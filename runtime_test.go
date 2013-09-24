@@ -3,8 +3,10 @@ package docker
 import (
 	"bytes"
 	"fmt"
+	"github.com/dotcloud/docker/devmapper"
 	"github.com/dotcloud/docker/utils"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -18,12 +20,13 @@ import (
 )
 
 const (
-	unitTestImageName     = "docker-test-image"
-	unitTestImageID       = "83599e29c455eb719f77d799bc7c51521b9551972f5a850d7ad265bc1b5292f6" // 1.0
-	unitTestNetworkBridge = "testdockbr0"
-	unitTestStoreBase     = "/var/lib/docker/unit-tests"
-	testDaemonAddr        = "127.0.0.1:4270"
-	testDaemonProto       = "tcp"
+	unitTestImageName        = "docker-test-image"
+	unitTestImageID          = "83599e29c455eb719f77d799bc7c51521b9551972f5a850d7ad265bc1b5292f6" // 1.0
+	unitTestNetworkBridge    = "testdockbr0"
+	unitTestStoreBase        = "/var/lib/docker/unit-tests"
+	unitTestStoreDevicesBase = "/var/lib/docker/unit-tests-devices"
+	testDaemonAddr           = "127.0.0.1:4270"
+	testDaemonProto          = "tcp"
 )
 
 var (
@@ -42,6 +45,10 @@ func nuke(runtime *Runtime) error {
 		}(container)
 	}
 	wg.Wait()
+
+	for _, container := range runtime.List() {
+		container.EnsureUnmounted()
+	}
 	return os.RemoveAll(runtime.root)
 }
 
@@ -56,9 +63,15 @@ func cleanup(runtime *Runtime) error {
 	}
 	for _, image := range images {
 		if image.ID != unitTestImageID {
-			runtime.graph.Delete(image.ID)
+			runtime.DeleteImage(image.ID)
 		}
 	}
+	return nil
+}
+
+func cleanupLast(runtime *Runtime) error {
+	cleanup(runtime)
+	runtime.deviceSet.Shutdown()
 	return nil
 }
 
@@ -69,6 +82,32 @@ func layerArchive(tarfile string) (io.Reader, error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// Remove any leftover device mapper devices from earlier runs of the unit tests
+func cleanupDevMapper() {
+	infos, _ := ioutil.ReadDir("/dev/mapper")
+	if infos != nil {
+		hasPool := false
+		for _, info := range infos {
+			name := info.Name()
+			if strings.HasPrefix(name, "docker-unit-tests-devices-") {
+				if name == "docker-unit-tests-devices-pool" {
+					hasPool = true
+				} else {
+					if err := devmapper.RemoveDevice(name); err != nil {
+						panic(fmt.Errorf("Unable to remove existing device %s: %s", name, err))
+					}
+				}
+			}
+			// We need to remove the pool last as the other devices block it
+			if hasPool {
+				if err := devmapper.RemoveDevice("docker-unit-tests-devices-pool"); err != nil {
+					panic(fmt.Errorf("Unable to remove existing device docker-unit-tests-devices-pool: %s", name, err))
+				}
+			}
+		}
+	}
 }
 
 func init() {
@@ -86,8 +125,16 @@ func init() {
 
 	NetworkBridgeIface = unitTestNetworkBridge
 
+	cleanupDevMapper()
+
+	// Always start from a clean set of loopback mounts
+	err := os.RemoveAll(unitTestStoreDevicesBase)
+	if err != nil {
+		panic(err)
+	}
+
 	// Make it our Store root
-	if runtime, err := NewRuntimeFromDirectory(unitTestStoreBase, false); err != nil {
+	if runtime, err := NewRuntimeFromDirectory(unitTestStoreBase, devmapper.NewDeviceSetDM(unitTestStoreDevicesBase), false); err != nil {
 		panic(err)
 	} else {
 		globalRuntime = runtime
@@ -456,7 +503,7 @@ func TestRestore(t *testing.T) {
 
 	// Here are are simulating a docker restart - that is, reloading all containers
 	// from scratch
-	runtime2, err := NewRuntimeFromDirectory(runtime1.root, false)
+	runtime2, err := NewRuntimeFromDirectory(runtime1.root, runtime1.deviceSet, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -566,7 +566,6 @@ func TestPostCommit(t *testing.T) {
 
 	srv := &Server{runtime: runtime}
 
-
 	// Create a container and remove a file
 	container, err := runtime.Create(
 		&Config{
@@ -647,12 +646,20 @@ func TestPostContainersCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := os.Stat(path.Join(container.rwPath(), "test")); err != nil {
+	if err := container.EnsureMounted(); err != nil {
+		t.Fatalf("Unable to mount container: %s", err)
+	}
+
+	if _, err := os.Stat(path.Join(container.RootfsPath(), "test")); err != nil {
 		if os.IsNotExist(err) {
 			utils.Debugf("Err: %s", err)
 			t.Fatalf("The test file has not been created")
 		}
 		t.Fatal(err)
+	}
+
+	if err := container.Unmount(); err != nil {
+		t.Fatalf("Unable to unmount container: %s", err)
 	}
 }
 

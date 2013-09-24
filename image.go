@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -136,6 +137,10 @@ func jsonPath(root string) string {
 	return path.Join(root, "json")
 }
 
+func mountPath(root string) string {
+	return path.Join(root, "mount")
+}
+
 func MountAUFS(ro []string, rw string, target string) error {
 	// FIXME: Now mount the layers
 	rwBranch := fmt.Sprintf("%v=rw", rw)
@@ -170,35 +175,509 @@ func (image *Image) TarLayer(compression Compression) (Archive, error) {
 	return Tar(layerPath, compression)
 }
 
-func (image *Image) Mount(root, rw string) error {
-	if mounted, err := Mounted(root); err != nil {
-		return err
-	} else if mounted {
-		return fmt.Errorf("%s is already mounted", root)
-	}
-	layers, err := image.layers()
+type TimeUpdate struct {
+	path string
+	time []syscall.Timeval
+}
+
+func (image *Image) applyLayer(layer, target string) error {
+	var updateTimes []TimeUpdate
+	oldmask := syscall.Umask(0)
+	defer syscall.Umask(oldmask)
+	err := filepath.Walk(layer, func(srcPath string, f os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip root
+		if srcPath == layer {
+			return nil
+		}
+
+		var srcStat syscall.Stat_t
+		err = syscall.Lstat(srcPath, &srcStat)
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(layer, srcPath)
+		if err != nil {
+			return err
+		}
+
+		targetPath := filepath.Join(target, relPath)
+
+		// Skip AUFS metadata
+		if matched, err := filepath.Match(".wh..wh.*", relPath); err != nil || matched {
+			if err != nil || !f.IsDir() {
+				return err
+			}
+			return filepath.SkipDir
+		}
+
+		// Find out what kind of modification happened
+		file := filepath.Base(srcPath)
+
+		// If there is a whiteout, then the file was removed
+		if strings.HasPrefix(file, ".wh.") {
+			originalFile := file[len(".wh."):]
+			deletePath := filepath.Join(filepath.Dir(targetPath), originalFile)
+
+			err = os.RemoveAll(deletePath)
+			if err != nil {
+				return err
+			}
+		} else {
+			var targetStat = &syscall.Stat_t{}
+			err := syscall.Lstat(targetPath, targetStat)
+			if err != nil {
+				if !os.IsNotExist(err) {
+					return err
+				}
+				targetStat = nil
+			}
+
+			if targetStat != nil && !(targetStat.Mode&syscall.S_IFDIR == syscall.S_IFDIR && srcStat.Mode&syscall.S_IFDIR == syscall.S_IFDIR) {
+				// Unless both src and dest are directories we remove the target and recreate it
+				// This is a bit wasteful in the case of only a mode change, but that is unlikely
+				// to matter much
+				err = os.RemoveAll(targetPath)
+				if err != nil {
+					return err
+				}
+				targetStat = nil
+			}
+
+			if f.IsDir() {
+				// Source is a directory
+				if targetStat == nil {
+					err = syscall.Mkdir(targetPath, srcStat.Mode&07777)
+					if err != nil {
+						return err
+					}
+				}
+			} else if srcStat.Mode&syscall.S_IFLNK == syscall.S_IFLNK {
+				// Source is symlink
+				link, err := os.Readlink(srcPath)
+				if err != nil {
+					return err
+				}
+
+				err = os.Symlink(link, targetPath)
+				if err != nil {
+					return err
+				}
+			} else if srcStat.Mode&syscall.S_IFBLK == syscall.S_IFBLK ||
+				srcStat.Mode&syscall.S_IFCHR == syscall.S_IFCHR ||
+				srcStat.Mode&syscall.S_IFIFO == syscall.S_IFIFO ||
+				srcStat.Mode&syscall.S_IFSOCK == syscall.S_IFSOCK {
+				// Source is special file
+				err = syscall.Mknod(targetPath, srcStat.Mode, int(srcStat.Rdev))
+				if err != nil {
+					return err
+				}
+			} else if srcStat.Mode&syscall.S_IFREG == syscall.S_IFREG {
+				// Source is regular file
+				fd, err := syscall.Open(targetPath, syscall.O_CREAT|syscall.O_WRONLY, srcStat.Mode&07777)
+				if err != nil {
+					return err
+				}
+				dstFile := os.NewFile(uintptr(fd), targetPath)
+				srcFile, err := os.Open(srcPath)
+				if err != nil {
+					_ = dstFile.Close()
+					return err
+				}
+				err = CopyFile(dstFile, srcFile)
+				_ = dstFile.Close()
+				_ = srcFile.Close()
+				if err != nil {
+					return err
+				}
+			} else {
+				return fmt.Errorf("Unknown type for file %s", srcPath)
+			}
+
+			err = syscall.Lchown(targetPath, int(srcStat.Uid), int(srcStat.Gid))
+			if err != nil {
+				return err
+			}
+
+			if srcStat.Mode&syscall.S_IFLNK != syscall.S_IFLNK {
+				err = syscall.Chmod(targetPath, srcStat.Mode&07777)
+				if err != nil {
+					return err
+				}
+			}
+
+			ts := []syscall.Timeval{
+				syscall.NsecToTimeval(srcStat.Atim.Nano()),
+				syscall.NsecToTimeval(srcStat.Mtim.Nano()),
+			}
+
+			u := TimeUpdate{
+				path: targetPath,
+				time: ts,
+			}
+
+			// Delay time updates until all other changes done, or it is
+			// overwritten for directories (by child changes)
+			updateTimes = append(updateTimes, u)
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
+
+	// We do this in reverse order so that children are updated before parents
+	for i := len(updateTimes) - 1; i >= 0; i-- {
+		update := updateTimes[i]
+
+		O_PATH := 010000000 // Not in syscall yet
+		fd, err := syscall.Open(update.path, syscall.O_RDWR|O_PATH|syscall.O_NOFOLLOW, 0600)
+		if err == syscall.EISDIR || err == syscall.ELOOP {
+			// O_PATH not supported, use Utimes except on symlinks where Utimes doesn't work
+			if err != syscall.ELOOP {
+				err = syscall.Utimes(update.path, update.time)
+				if err != nil {
+					return err
+				}
+			}
+		} else {
+			if err != nil {
+				return err
+			}
+			syscall.Futimes(fd, update.time)
+			_ = syscall.Close(fd)
+		}
+	}
+
+	return nil
+}
+
+func (image *Image) ensureImageDevice(devices DeviceSet) error {
+	if devices.HasInitializedDevice(image.ID) {
+		return nil
+	}
+
+	if image.Parent != "" && !devices.HasInitializedDevice(image.Parent) {
+		parentImg, err := image.GetParent()
+		if err != nil {
+			return fmt.Errorf("Error while getting parent image: %v", err)
+		}
+		err = parentImg.ensureImageDevice(devices)
+		if err != nil {
+			return err
+		}
+	}
+
+	root, err := image.root()
+	if err != nil {
+		return err
+	}
+
+	mountDir := mountPath(root)
+	if err := os.Mkdir(mountDir, 0600); err != nil && !os.IsExist(err) {
+		return err
+	}
+
+	mounted, err := Mounted(mountDir)
+	if err == nil && mounted {
+		utils.Debugf("Image %s is unexpectedly mounted, unmounting...", image.ID)
+		err = syscall.Unmount(mountDir, 0)
+		if err != nil {
+			return err
+		}
+	}
+
+	if devices.HasDevice(image.ID) {
+		utils.Debugf("Found non-initialized demove-mapper device for image %s, removing", image.ID)
+		err = devices.RemoveDevice(image.ID)
+		if err != nil {
+			return err
+		}
+	}
+
+	utils.Debugf("Creating device-mapper device for image id %s", image.ID)
+	err = devices.AddDevice(image.ID, image.Parent)
+	if err != nil {
+		return err
+	}
+
+	err = devices.MountDevice(image.ID, mountDir)
+	if err != nil {
+		_ = devices.RemoveDevice(image.ID)
+		return err
+	}
+
+	err = ioutil.WriteFile(path.Join(mountDir, ".docker-id"), []byte(image.ID), 0600)
+	if err != nil {
+		_ = devices.UnmountDevice(image.ID, mountDir)
+		_ = devices.RemoveDevice(image.ID)
+		return err
+	}
+
+	err = image.applyLayer(layerPath(root), mountDir)
+	if err != nil {
+		_ = devices.UnmountDevice(image.ID, mountDir)
+		_ = devices.RemoveDevice(image.ID)
+		return err
+	}
+
+	// The docker init layer is conceptually above all other layers, so we apply
+	// it for every image. This is safe because the layer directory is the
+	// definition of the image, and the device-mapper device is just a cache
+	// of it instantiated. Diffs/commit compare the container device with the
+	// image device, which will then *not* pick up the init layer changes as
+	// part of the container changes
+	dockerinitLayer, err := image.getDockerInitLayer()
+	if err != nil {
+		_ = devices.UnmountDevice(image.ID, mountDir)
+		_ = devices.RemoveDevice(image.ID)
+		return err
+	}
+	err = image.applyLayer(dockerinitLayer, mountDir)
+	if err != nil {
+		_ = devices.UnmountDevice(image.ID, mountDir)
+		_ = devices.RemoveDevice(image.ID)
+		return err
+	}
+
+	err = devices.UnmountDevice(image.ID, mountDir)
+	if err != nil {
+		_ = devices.RemoveDevice(image.ID)
+		return err
+	}
+
+	devices.SetInitialized(image.ID)
+
+	// No need to the device-mapper device to hang around once we've written
+	// the image, it can be enabled on-demand when needed
+	devices.DeactivateDevice(image.ID)
+
+	return nil
+}
+
+func (image *Image) Mounted(runtime *Runtime, root, rw string) (bool, error) {
+	method := runtime.GetMountMethod()
+	if method == MountMethodFilesystem {
+		if _, err := os.Stat(rw); err != nil {
+			if os.IsNotExist(err) {
+				err = nil
+			}
+			return false, err
+		}
+		mountedPath := path.Join(rw, ".fs-mounted")
+		if _, err := os.Stat(mountedPath); err != nil {
+			if os.IsNotExist(err) {
+				err = nil
+			}
+			return false, err
+		}
+		return true, nil
+	} else {
+		return Mounted(root)
+	}
+}
+
+func (image *Image) Mount(runtime *Runtime, root, rw string, id string) error {
+	if mounted, _ := image.Mounted(runtime, root, rw); mounted {
+		return fmt.Errorf("%s is already mounted", root)
+	}
+
 	// Create the target directories if they don't exist
 	if err := os.Mkdir(root, 0755); err != nil && !os.IsExist(err) {
 		return err
 	}
-	if err := os.Mkdir(rw, 0755); err != nil && !os.IsExist(err) {
-		return err
-	}
-	if err := MountAUFS(layers, rw, root); err != nil {
-		return err
+
+	switch runtime.GetMountMethod() {
+	case MountMethodNone:
+		return fmt.Errorf("No supported Mount implementation")
+
+	case MountMethodAUFS:
+		if err := os.Mkdir(rw, 0755); err != nil && !os.IsExist(err) {
+			return err
+		}
+		layers, err := image.layers()
+		if err != nil {
+			return err
+		}
+		if err := MountAUFS(layers, rw, root); err != nil {
+			return err
+		}
+
+	case MountMethodDeviceMapper:
+		devices, err := runtime.GetDeviceSet()
+		if err != nil {
+			return err
+		}
+		err = image.ensureImageDevice(devices)
+		if err != nil {
+			return err
+		}
+
+		createdDevice := false
+		if !devices.HasDevice(id) {
+			utils.Debugf("Creating device %s for container based on image %s", id, image.ID)
+			err = devices.AddDevice(id, image.ID)
+			if err != nil {
+				return err
+			}
+			createdDevice = true
+		}
+
+		utils.Debugf("Mounting container %s at %s for container", id, root)
+		err = devices.MountDevice(id, root)
+		if err != nil {
+			return err
+		}
+
+		if createdDevice {
+			err = ioutil.WriteFile(path.Join(root, ".docker-id"), []byte(id), 0600)
+			if err != nil {
+				_ = devices.RemoveDevice(image.ID)
+				return err
+			}
+		}
+
+	case MountMethodFilesystem:
+		if err := os.Mkdir(rw, 0755); err != nil && !os.IsExist(err) {
+			return err
+		}
+
+		layers, err := image.layers()
+		if err != nil {
+			return err
+		}
+
+		for i := len(layers) - 1; i >= 0; i-- {
+			layer := layers[i]
+			if err = image.applyLayer(layer, root); err != nil {
+				return err
+			}
+		}
+
+		mountedPath := path.Join(rw, ".fs-mounted")
+		fo, err := os.Create(mountedPath)
+		if err != nil {
+			return err
+		}
+		fo.Close()
 	}
 	return nil
 }
 
-func (image *Image) Changes(rw string) ([]Change, error) {
-	layers, err := image.layers()
-	if err != nil {
-		return nil, err
+func (image *Image) Unmount(runtime *Runtime, root string, id string) error {
+	switch runtime.GetMountMethod() {
+	case MountMethodNone:
+		return fmt.Errorf("No supported Unmount implementation")
+
+	case MountMethodAUFS:
+		return Unmount(root)
+
+	case MountMethodDeviceMapper:
+		// Try to deactivate the device as generally there is no use for it anymore
+		devices, err := runtime.GetDeviceSet()
+		if err != nil {
+			return err
+		}
+
+		err = devices.UnmountDevice(id, root)
+		if err != nil {
+			return err
+		}
+
+		return devices.DeactivateDevice(id)
+
+	case MountMethodFilesystem:
+		return nil
 	}
-	return Changes(layers, rw)
+
+	return nil
+}
+
+func (image *Image) Changes(runtime *Runtime, root, rw, id string) ([]Change, error) {
+	switch runtime.GetMountMethod() {
+	case MountMethodAUFS:
+		layers, err := image.layers()
+		if err != nil {
+			return nil, err
+		}
+		return ChangesAUFS(layers, rw)
+
+	case MountMethodDeviceMapper:
+		devices, err := runtime.GetDeviceSet()
+		if err != nil {
+			return nil, err
+		}
+
+		if err := os.Mkdir(rw, 0755); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+
+		wasActivated := devices.HasActivatedDevice(image.ID)
+
+		// We re-use rw for the temporary mount of the base image as its
+		// not used by device-mapper otherwise
+		err = devices.MountDevice(image.ID, rw)
+		if err != nil {
+			return nil, err
+		}
+
+		changes, err := ChangesDirs(root, rw)
+		_ = devices.UnmountDevice(image.ID, rw)
+		if !wasActivated {
+			_ = devices.DeactivateDevice(image.ID)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return changes, nil
+
+	case MountMethodFilesystem:
+		layers, err := image.layers()
+		if err != nil {
+			return nil, err
+		}
+		changes, err := ChangesLayers(root, layers)
+		if err != nil {
+			return nil, err
+		}
+		return changes, nil
+	}
+
+	return nil, fmt.Errorf("No supported Changes implementation")
+}
+
+func (image *Image) ExportChanges(runtime *Runtime, root, rw, id string) (Archive, error) {
+	switch runtime.GetMountMethod() {
+	case MountMethodAUFS:
+		return Tar(rw, Uncompressed)
+
+	case MountMethodFilesystem, MountMethodDeviceMapper:
+		changes, err := image.Changes(runtime, root, rw, id)
+		if err != nil {
+			return nil, err
+		}
+
+		files := make([]string, 0)
+		deletions := make([]string, 0)
+		for _, change := range changes {
+			if change.Kind == ChangeModify || change.Kind == ChangeAdd {
+				files = append(files, change.Path)
+			}
+			if change.Kind == ChangeDelete {
+				base := filepath.Base(change.Path)
+				dir := filepath.Dir(change.Path)
+				deletions = append(deletions, filepath.Join(dir, ".wh."+base))
+			}
+		}
+
+		return TarFilter(root, Uncompressed, files, false, deletions)
+	}
+
+	return nil, fmt.Errorf("No supported Changes implementation")
 }
 
 func (image *Image) ShortID() string {
