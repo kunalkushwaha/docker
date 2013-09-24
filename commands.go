@@ -1755,7 +1755,7 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 	rwc, br := clientconn.Hijack()
 	defer rwc.Close()
 
-	var receiveStdout (chan error)
+	var receiveStdout chan error
 	if out != nil {
 		receiveStdout = utils.Go(func() error {
 			_, err := io.Copy(out, br)
